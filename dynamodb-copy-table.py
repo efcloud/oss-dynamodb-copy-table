@@ -22,31 +22,56 @@ class CopyError(Exception):
     pass
 
 
-def check_key_schemas(client, source, target):
-    """Abort early if the target table cannot accept the source items."""
-    source_keys = client.describe_table(TableName=source)['Table']['KeySchema']
-    target_keys = client.describe_table(TableName=target)['Table']['KeySchema']
+def rename_field(name, fieldsToChange):
+    """Return the attribute name after applying the rename mappings in order."""
+    for old, new in fieldsToChange:
+        if name == old:
+            name = new
+    return name
 
-    def normalise(schema):
-        return sorted((key['KeyType'], key['AttributeName']) for key in schema)
 
-    if normalise(source_keys) != normalise(target_keys):
+def check_key_schemas(client, source, target, fieldsToChange):
+    """Abort early if the target table cannot accept the source items.
+
+    Compares key attribute names, roles (HASH/RANGE) and types, with the
+    rename mappings applied to the source key names. A target with a
+    different key would either reject the items or let items overwrite each
+    other while the copy reports success.
+    """
+    def key_schema(table_name, renames=()):
+        table = client.describe_table(TableName=table_name)['Table']
+        types = {
+            definition['AttributeName']: definition['AttributeType']
+            for definition in table.get('AttributeDefinitions', [])
+        }
+        return sorted(
+            (key['KeyType'], rename_field(key['AttributeName'], renames), types.get(key['AttributeName']))
+            for key in table['KeySchema']
+        )
+
+    source_keys = key_schema(source, fieldsToChange)
+    target_keys = key_schema(target)
+    if source_keys != target_keys:
         raise CopyError(
-            "Key schema mismatch. Source %s: %s, target %s: %s"
+            "Key schema mismatch (key type, attribute name after renames, attribute type). Source %s: %s, target %s: %s"
             % (source, source_keys, target, target_keys)
         )
 
 
-def write_batch(client, target, batch):
+def write_batch(client, target, batch, on_written):
     """Write a batch, retrying anything DynamoDB returns as unprocessed.
 
     batch_write_item succeeds even when only part of the batch was written,
     so the response has to be checked and the remainder resubmitted.
+    on_written is called with the number of items acknowledged by each
+    response, so partial successes are counted even if the batch later fails.
     """
     pending = batch
     for attempt in range(MAX_BATCH_ATTEMPTS):
         response = client.batch_write_item(RequestItems={target: pending})
-        pending = response.get('UnprocessedItems', {}).get(target, [])
+        unprocessed = response.get('UnprocessedItems', {}).get(target, [])
+        on_written(len(pending) - len(unprocessed))
+        pending = unprocessed
         if not pending:
             return
         time.sleep(min(MAX_BACKOFF_SECONDS, 0.1 * (2 ** attempt)))
@@ -57,32 +82,20 @@ def write_batch(client, target, batch):
     )
 
 
-def build_filter(field, value_from, value_to, value_type):
-    """Build scan arguments keeping only items whose field is within the range.
+def build_filter(field, value_from):
+    """Build scan arguments keeping only items whose field is >= value_from.
 
-    Bounds are inclusive. Items that do not have the field never match.
-    Returns an empty dict when no filter was requested.
+    The field is compared as a string, e.g. an ISO 8601 date. Items that do
+    not have the field never match. Returns an empty dict when no filter
+    was requested.
     """
     if not field:
         return {}
 
-    values = {}
-    if value_from is not None:
-        values[':from'] = {value_type: value_from}
-    if value_to is not None:
-        values[':to'] = {value_type: value_to}
-
-    if value_from is not None and value_to is not None:
-        expression = '#field BETWEEN :from AND :to'
-    elif value_from is not None:
-        expression = '#field >= :from'
-    else:
-        expression = '#field <= :to'
-
     return {
-        'FilterExpression': expression,
+        'FilterExpression': '#field >= :from',
         'ExpressionAttributeNames': {'#field': field},
-        'ExpressionAttributeValues': values,
+        'ExpressionAttributeValues': {':from': {'S': value_from}},
     }
 
 
@@ -111,6 +124,8 @@ class Progress:
             self.scanned += count
 
     def add_written(self, count):
+        if not count:
+            return
         with self.lock:
             self.written += count
             self.render()
@@ -161,7 +176,7 @@ def copy_segment(source, target, region, fieldsToChange, scan_filter, segment, t
 
         progress.add_scanned(len(batch))
         try:
-            write_batch(dynamo_target_client, target, batch)
+            write_batch(dynamo_target_client, target, batch, progress.add_written)
         except Exception as e:
             stop.set()
             with progress.lock:
@@ -169,8 +184,6 @@ def copy_segment(source, target, region, fieldsToChange, scan_filter, segment, t
                 print("Failed to write batch to target table: %s" % e)
                 print("Keys/items in the failed batch: %s" % batch)
             raise CopyError("Copy incomplete") from e
-
-        progress.add_written(len(batch))
 
 
 def migrate(source, target, region, fieldsToChange, workers=1, scan_filter=None):
@@ -183,17 +196,14 @@ def migrate(source, target, region, fieldsToChange, workers=1, scan_filter=None)
 
     scan_filter = scan_filter or {}
     if scan_filter:
-        print("Filtering on %s with %s" % (
+        print("Filtering on %s >= %s" % (
             scan_filter['ExpressionAttributeNames']['#field'],
-            ', '.join("%s %s" % (name[1:], list(value.values())[0])
-                      for name, value in sorted(scan_filter['ExpressionAttributeValues'].items())),
+            scan_filter['ExpressionAttributeValues'][':from']['S'],
         ))
 
     dynamo_client = boto3.client('dynamodb', region_name=region, config=BOTO_CONFIG)
 
-    if not fieldsToChange:
-        # Renaming fields may legitimately change the key attribute names
-        check_key_schemas(dynamo_client, source, target)
+    check_key_schemas(dynamo_client, source, target, fieldsToChange)
 
     # Note that itemCount is an approximate value. The value in AWS is updated every 6 hours.
     itemCount = dynamo_client.describe_table(TableName=source)['Table'].get('ItemCount', 0)
@@ -242,24 +252,17 @@ if __name__ == '__main__':
     parser.add_argument("--region", help="AWS region (default: eu-west-2)", type=str, nargs="?", default="eu-west-2")
     parser.add_argument("--fieldsToChange", help="Field name to change, and new name to use e.g. 'oldField,newField'", type=str, nargs='*', default=[])
     parser.add_argument("--workers", help="Number of parallel scan segments/threads (default: 1)", type=int, default=1)
-    parser.add_argument("--filterField", help="Only copy items whose value in this top-level field is within --filterFrom/--filterTo", type=str)
-    parser.add_argument("--filterFrom", help="Lower bound for --filterField, inclusive e.g. '2026-01-01'", type=str)
-    parser.add_argument("--filterTo", help="Upper bound for --filterField, inclusive e.g. '2026-12-31T23:59:59Z'", type=str)
-    parser.add_argument("--filterType", help="DynamoDB type of --filterField: S for strings such as ISO 8601 dates, N for numbers such as epoch timestamps (default: S)", type=str, choices=['S', 'N'], default='S')
+    parser.add_argument("--filterField", help="Only copy items whose value in this top-level string field is >= --filterFrom", type=str)
+    parser.add_argument("--filterFrom", help="Lower bound for --filterField, inclusive e.g. '2026-01-01T00:00:00Z'", type=str)
     args = parser.parse_args()
     if not 1 <= args.workers <= MAX_WORKERS:
         parser.error("--workers must be between 1 and %d" % MAX_WORKERS)
-    if args.filterField and args.filterFrom is None and args.filterTo is None:
-        parser.error("--filterField needs --filterFrom and/or --filterTo")
-    if not args.filterField and (args.filterFrom is not None or args.filterTo is not None):
-        parser.error("--filterFrom/--filterTo need --filterField")
-    if args.filterType == 'N':
-        for bound in (args.filterFrom, args.filterTo):
-            try:
-                float(bound) if bound is not None else None
-            except ValueError:
-                parser.error("'%s' is not a number, required with --filterType N" % bound)
-    scan_filter = build_filter(args.filterField, args.filterFrom, args.filterTo, args.filterType)
+    for field in args.fieldsToChange:
+        if len(field.split(',')) != 2 or not all(field.split(',')):
+            parser.error("--fieldsToChange '%s' must be in the form 'oldField,newField'" % field)
+    if bool(args.filterField) != (args.filterFrom is not None):
+        parser.error("--filterField and --filterFrom must be used together")
+    scan_filter = build_filter(args.filterField, args.filterFrom)
     try:
         migrate(args.sourceTable, args.targetTable, args.region, args.fieldsToChange, args.workers, scan_filter)
     except CopyError as e:

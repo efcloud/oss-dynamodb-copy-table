@@ -58,19 +58,15 @@ more workers consume more read capacity on the source and write capacity on the 
 python dynamodb-copy-table.py src_table dst_table --workers=8
 ```
 
-`filterField`, `filterFrom`, `filterTo`, `filterType`: only copy items whose value in a
-top-level field is within a range. Bounds are inclusive and either one can be omitted.
-Items that do not have the field are not copied.
+`filterField`, `filterFrom`: only copy items whose value in a top-level string field is
+greater than or equal to `filterFrom`, e.g. everything from a given date onward.
+Both must be given together. Items that do not have the field are not copied.
 
 ```shell
-# ISO 8601 date strings (default type S, compared as text)
-python dynamodb-copy-table.py src_table dst_table --filterField=createdAt --filterFrom=2026-01-01 --filterTo=2026-06-30T23:59:59Z
-
-# Epoch timestamps stored as numbers
-python dynamodb-copy-table.py src_table dst_table --filterField=createdAt --filterType=N --filterFrom=1767225600
+python dynamodb-copy-table.py src_table dst_table --filterField=createdAt --filterFrom=2026-01-01T00:00:00Z
 ```
 
-String dates are compared as text, so this only works when every value uses the same sortable
+Values are compared as text, so this only works when every value uses the same sortable
 format (such as ISO 8601 in a single timezone). The filter is applied after DynamoDB reads each
 item, so the whole table is still scanned and read capacity is consumed for every item.
 The filter is evaluated on the source field name, before any `--fieldsToChange` rename.
