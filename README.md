@@ -10,7 +10,7 @@ This was tested using `python 3.12` and `boto3@1.34.109`
 This script assumes a table is already created in the destination account.
 
 - Python 3.12
-- boto3 (`pip install boto3`)
+- boto3 >= 1.44.1 (`pip install -r requirements.txt`)
 
 ```
 # Pyenv v3.12
@@ -42,7 +42,7 @@ $ python dynamodb-copy-table.py src_table dst_table
 
 ### Arguments:
 
-`region`: the default region is `us-west-2`
+`region`: the default region is `eu-west-2`
 
 ```shell
 export AWS_PROFILE=
