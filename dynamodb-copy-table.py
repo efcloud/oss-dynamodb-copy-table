@@ -57,11 +57,41 @@ def write_batch(client, target, batch):
     )
 
 
+def build_filter(field, value_from, value_to, value_type):
+    """Build scan arguments keeping only items whose field is within the range.
+
+    Bounds are inclusive. Items that do not have the field never match.
+    Returns an empty dict when no filter was requested.
+    """
+    if not field:
+        return {}
+
+    values = {}
+    if value_from is not None:
+        values[':from'] = {value_type: value_from}
+    if value_to is not None:
+        values[':to'] = {value_type: value_to}
+
+    if value_from is not None and value_to is not None:
+        expression = '#field BETWEEN :from AND :to'
+    elif value_from is not None:
+        expression = '#field >= :from'
+    else:
+        expression = '#field <= :to'
+
+    return {
+        'FilterExpression': expression,
+        'ExpressionAttributeNames': {'#field': field},
+        'ExpressionAttributeValues': values,
+    }
+
+
 class Progress:
     """Thread-safe item counters and progress bar shared by all workers."""
 
     def __init__(self, estimated_total):
         self.estimated_total = estimated_total
+        self.examined = 0
         self.scanned = 0
         self.written = 0
         self.lock = threading.Lock()
@@ -71,6 +101,10 @@ class Progress:
         # The estimated count can be stale, keep the bar below 100% until the scan ends
         total = self.written if final else max(self.estimated_total, self.written + 1)
         printProgressBar(self.written, total, prefix='Progress:', suffix='Complete', length=50)
+
+    def add_examined(self, count):
+        with self.lock:
+            self.examined += count
 
     def add_scanned(self, count):
         with self.lock:
@@ -82,7 +116,7 @@ class Progress:
             self.render()
 
 
-def copy_segment(source, target, region, fieldsToChange, segment, total_segments, progress, stop):
+def copy_segment(source, target, region, fieldsToChange, scan_filter, segment, total_segments, progress, stop):
     """Scan one segment of the source table and write its items to the target."""
     # Adaptive retry mode rate-limits per client, so each worker gets its own
     dynamo_client = boto3.client('dynamodb', region_name=region, config=BOTO_CONFIG)
@@ -97,6 +131,9 @@ def copy_segment(source, target, region, fieldsToChange, segment, total_segments
             'PageSize': ITEMS_PER_BATCH,
         },
     }
+    # The filter is applied by DynamoDB after reading, so pages can come back
+    # with fewer items than PageSize, or none at all
+    scan_args.update(scan_filter)
     if total_segments > 1:
         # Parallel scan: DynamoDB splits the table into disjoint segments
         scan_args['Segment'] = segment
@@ -106,6 +143,7 @@ def copy_segment(source, target, region, fieldsToChange, segment, total_segments
         if stop.is_set():
             return
 
+        progress.add_examined(page.get('ScannedCount', len(page['Items'])))
         batch = []
         for item in page['Items']:
             for field in fieldsToChange:
@@ -135,13 +173,21 @@ def copy_segment(source, target, region, fieldsToChange, segment, total_segments
         progress.add_written(len(batch))
 
 
-def migrate(source, target, region, fieldsToChange, workers=1):
+def migrate(source, target, region, fieldsToChange, workers=1, scan_filter=None):
     print("Copying contents of table %s to %s in region %s using %d worker(s)" % (source, target, region, workers))
 
     if len(fieldsToChange) > 0:
         fieldsToChange = [field.split(',') for field in fieldsToChange]
         for field in fieldsToChange:
             print("Changing field %s to %s" % (field[0], field[1]))
+
+    scan_filter = scan_filter or {}
+    if scan_filter:
+        print("Filtering on %s with %s" % (
+            scan_filter['ExpressionAttributeNames']['#field'],
+            ', '.join("%s %s" % (name[1:], list(value.values())[0])
+                      for name, value in sorted(scan_filter['ExpressionAttributeValues'].items())),
+        ))
 
     dynamo_client = boto3.client('dynamodb', region_name=region, config=BOTO_CONFIG)
 
@@ -162,7 +208,7 @@ def migrate(source, target, region, fieldsToChange, workers=1):
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [
-            executor.submit(copy_segment, source, target, region, fieldsToChange, segment, workers, progress, stop)
+            executor.submit(copy_segment, source, target, region, fieldsToChange, scan_filter, segment, workers, progress, stop)
             for segment in range(workers)
         ]
         for future in as_completed(futures):
@@ -184,6 +230,8 @@ def migrate(source, target, region, fieldsToChange, workers=1):
         progress.render(final=True)
     else:
         print()
+    if scan_filter:
+        print("Filter matched %d of %d items examined." % (progress.scanned, progress.examined))
     print("Done. Scanned %d items, wrote %d items." % (progress.scanned, progress.written))
 
 
@@ -194,11 +242,26 @@ if __name__ == '__main__':
     parser.add_argument("--region", help="AWS region (default: eu-west-2)", type=str, nargs="?", default="eu-west-2")
     parser.add_argument("--fieldsToChange", help="Field name to change, and new name to use e.g. 'oldField,newField'", type=str, nargs='*', default=[])
     parser.add_argument("--workers", help="Number of parallel scan segments/threads (default: 1)", type=int, default=1)
+    parser.add_argument("--filterField", help="Only copy items whose value in this top-level field is within --filterFrom/--filterTo", type=str)
+    parser.add_argument("--filterFrom", help="Lower bound for --filterField, inclusive e.g. '2026-01-01'", type=str)
+    parser.add_argument("--filterTo", help="Upper bound for --filterField, inclusive e.g. '2026-12-31T23:59:59Z'", type=str)
+    parser.add_argument("--filterType", help="DynamoDB type of --filterField: S for strings such as ISO 8601 dates, N for numbers such as epoch timestamps (default: S)", type=str, choices=['S', 'N'], default='S')
     args = parser.parse_args()
     if not 1 <= args.workers <= MAX_WORKERS:
         parser.error("--workers must be between 1 and %d" % MAX_WORKERS)
+    if args.filterField and args.filterFrom is None and args.filterTo is None:
+        parser.error("--filterField needs --filterFrom and/or --filterTo")
+    if not args.filterField and (args.filterFrom is not None or args.filterTo is not None):
+        parser.error("--filterFrom/--filterTo need --filterField")
+    if args.filterType == 'N':
+        for bound in (args.filterFrom, args.filterTo):
+            try:
+                float(bound) if bound is not None else None
+            except ValueError:
+                parser.error("'%s' is not a number, required with --filterType N" % bound)
+    scan_filter = build_filter(args.filterField, args.filterFrom, args.filterTo, args.filterType)
     try:
-        migrate(args.sourceTable, args.targetTable, args.region, args.fieldsToChange, args.workers)
+        migrate(args.sourceTable, args.targetTable, args.region, args.fieldsToChange, args.workers, scan_filter)
     except CopyError as e:
         print("ERROR: %s" % e, file=sys.stderr)
         sys.exit(1)
