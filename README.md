@@ -50,6 +50,14 @@ export AWS_PROFILE=
 python dynamodb-copy-table.py src_table dst_table --region=cn-north-1
 ```
 
+`workers`: number of parallel threads (default `1`, max `64`). Each worker scans its own
+segment of the source table using a DynamoDB parallel scan. Only worth using on large tables;
+more workers consume more read capacity on the source and write capacity on the target.
+
+```shell
+python dynamodb-copy-table.py src_table dst_table --workers=8
+```
+
 ### References
 
 - [Import and Export DynamoDB Data using AWS Data Pipeline](http://docs.aws.amazon.com/datapipeline/latest/DeveloperGuide/dp-importexport-ddb.html)
