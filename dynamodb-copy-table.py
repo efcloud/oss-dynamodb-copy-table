@@ -82,21 +82,47 @@ def write_batch(client, target, batch, on_written):
     )
 
 
-def build_filter(field, value_from):
-    """Build scan arguments keeping only items whose field is >= value_from.
+def build_filter(field, value_from, equals=()):
+    """Build scan arguments from the range filter and the equality filters.
 
-    The field is compared as a string, e.g. an ISO 8601 date. Items that do
-    not have the field never match. Returns an empty dict when no filter
-    was requested.
+    Keeps only items whose field is >= value_from and whose every equals
+    field holds exactly the given value. Values are compared as strings,
+    e.g. an ISO 8601 date. Items that do not have a filtered field never
+    match. Returns an empty dict when no filter was requested.
     """
-    if not field:
+    conditions = []
+    names = {}
+    values = {}
+
+    if field:
+        conditions.append('#field >= :from')
+        names['#field'] = field
+        values[':from'] = {'S': value_from}
+
+    for index, (name, value) in enumerate(equals):
+        conditions.append('#eq%d = :eq%d' % (index, index))
+        names['#eq%d' % index] = name
+        values[':eq%d' % index] = {'S': value}
+
+    if not conditions:
         return {}
 
     return {
-        'FilterExpression': '#field >= :from',
-        'ExpressionAttributeNames': {'#field': field},
-        'ExpressionAttributeValues': {':from': {'S': value_from}},
+        'FilterExpression': ' AND '.join(conditions),
+        'ExpressionAttributeNames': names,
+        'ExpressionAttributeValues': values,
     }
+
+
+def describe_filter(scan_filter):
+    """Render the filter expression with the real field names and values."""
+    text = scan_filter['FilterExpression']
+    # Longest placeholder first, so #eq1 does not eat the start of #eq10
+    for placeholder, name in sorted(scan_filter['ExpressionAttributeNames'].items(), key=lambda pair: -len(pair[0])):
+        text = text.replace(placeholder, name)
+    for placeholder, value in sorted(scan_filter['ExpressionAttributeValues'].items(), key=lambda pair: -len(pair[0])):
+        text = text.replace(placeholder, "'%s'" % value['S'])
+    return text
 
 
 class Progress:
@@ -142,12 +168,10 @@ def copy_segment(source, target, region, fieldsToChange, scan_filter, segment, t
         'Select': 'ALL_ATTRIBUTES',
         'ReturnConsumedCapacity': 'NONE',
         'ConsistentRead': True,
-        'PaginationConfig': {
-            'PageSize': ITEMS_PER_BATCH,
-        },
     }
-    # The filter is applied by DynamoDB after reading, so pages can come back
-    # with fewer items than PageSize, or none at all
+    # No page size: each request reads up to 1 MB, far fewer round trips than
+    # one request per write batch. The filter is applied by DynamoDB after
+    # reading, so pages can come back with few items, or none at all
     scan_args.update(scan_filter)
     if total_segments > 1:
         # Parallel scan: DynamoDB splits the table into disjoint segments
@@ -159,31 +183,33 @@ def copy_segment(source, target, region, fieldsToChange, scan_filter, segment, t
             return
 
         progress.add_examined(page.get('ScannedCount', len(page['Items'])))
-        batch = []
+        requests = []
         for item in page['Items']:
             for field in fieldsToChange:
                 if field[0] in item:
                     item[field[1]] = item.pop(field[0])
-            batch.append({
+            requests.append({
                 'PutRequest': {
                     'Item': item
                 }
             })
 
+        progress.add_scanned(len(requests))
         # AWS has a minimum of 1 and a maximum of 25 items per batch
-        if len(batch) == 0:
-            continue
+        for start in range(0, len(requests), ITEMS_PER_BATCH):
+            if stop.is_set():
+                return
 
-        progress.add_scanned(len(batch))
-        try:
-            write_batch(dynamo_target_client, target, batch, progress.add_written)
-        except Exception as e:
-            stop.set()
-            with progress.lock:
-                print()
-                print("Failed to write batch to target table: %s" % e)
-                print("Keys/items in the failed batch: %s" % batch)
-            raise CopyError("Copy incomplete") from e
+            batch = requests[start:start + ITEMS_PER_BATCH]
+            try:
+                write_batch(dynamo_target_client, target, batch, progress.add_written)
+            except Exception as e:
+                stop.set()
+                with progress.lock:
+                    print()
+                    print("Failed to write batch to target table: %s" % e)
+                    print("Keys/items in the failed batch: %s" % batch)
+                raise CopyError("Copy incomplete") from e
 
 
 def migrate(source, target, region, fieldsToChange, workers=1, scan_filter=None):
@@ -196,10 +222,7 @@ def migrate(source, target, region, fieldsToChange, workers=1, scan_filter=None)
 
     scan_filter = scan_filter or {}
     if scan_filter:
-        print("Filtering on %s >= %s" % (
-            scan_filter['ExpressionAttributeNames']['#field'],
-            scan_filter['ExpressionAttributeValues'][':from']['S'],
-        ))
+        print("Filtering on %s" % describe_filter(scan_filter))
 
     dynamo_client = boto3.client('dynamodb', region_name=region, config=BOTO_CONFIG)
 
@@ -254,6 +277,7 @@ if __name__ == '__main__':
     parser.add_argument("--workers", help="Number of parallel scan segments/threads (default: 1)", type=int, default=1)
     parser.add_argument("--filterField", help="Only copy items whose value in this top-level string field is >= --filterFrom", type=str)
     parser.add_argument("--filterFrom", help="Lower bound for --filterField, inclusive e.g. '2026-01-01T00:00:00Z'", type=str)
+    parser.add_argument("--filterEquals", help="Only copy items whose top-level string field equals the value e.g. 'sourceType=aic'; repeat for several fields", type=str, nargs='*', default=[])
     args = parser.parse_args()
     if not 1 <= args.workers <= MAX_WORKERS:
         parser.error("--workers must be between 1 and %d" % MAX_WORKERS)
@@ -262,7 +286,13 @@ if __name__ == '__main__':
             parser.error("--fieldsToChange '%s' must be in the form 'oldField,newField'" % field)
     if bool(args.filterField) != (args.filterFrom is not None):
         parser.error("--filterField and --filterFrom must be used together")
-    scan_filter = build_filter(args.filterField, args.filterFrom)
+    equals = []
+    for pair in args.filterEquals:
+        name, separator, value = pair.partition('=')
+        if not name or not separator or not value:
+            parser.error("--filterEquals '%s' must be in the form 'field=value'" % pair)
+        equals.append((name, value))
+    scan_filter = build_filter(args.filterField, args.filterFrom, equals)
     try:
         migrate(args.sourceTable, args.targetTable, args.region, args.fieldsToChange, args.workers, scan_filter)
     except CopyError as e:

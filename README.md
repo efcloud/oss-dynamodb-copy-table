@@ -71,6 +71,15 @@ format (such as ISO 8601 in a single timezone). The filter is applied after Dyna
 item, so the whole table is still scanned and read capacity is consumed for every item.
 The filter is evaluated on the source field name, before any `--fieldsToChange` rename.
 
+`filterEquals`: only copy items whose top-level string field holds exactly the given value,
+written as `field=value`. Several pairs can be given and all must match. It combines with
+`filterField`/`filterFrom`, and like them it is applied after the read, on the source field name.
+
+```shell
+python dynamodb-copy-table.py src_table dst_table --filterEquals sourceType=aic
+python dynamodb-copy-table.py src_table dst_table --filterField=sortKey --filterFrom=2026-01-01T00:00:00Z --filterEquals sourceType=aic
+```
+
 ### References
 
 - [Import and Export DynamoDB Data using AWS Data Pipeline](http://docs.aws.amazon.com/datapipeline/latest/DeveloperGuide/dp-importexport-ddb.html)
